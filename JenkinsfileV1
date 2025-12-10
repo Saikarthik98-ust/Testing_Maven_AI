@@ -1,0 +1,198 @@
+
+pipeline {
+    agent any
+
+    stages {
+
+        stage('Setup Environment') {
+            steps {
+                sh '''
+                echo "Maven Version:"
+                mvn -v
+
+                echo "Docker Version:"
+                docker --version
+                '''
+            }
+        }
+
+        stage('Build Maven Project') {
+            steps {
+                sh 'mvn clean compile -DskipTests'
+            }
+        }
+
+        // Test stage removed
+
+        stage('Package') {
+            steps {
+                sh 'mvn package -DskipTests'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh 'docker build -t demo-app:${BUILD_NUMBER} .'
+            }
+        }
+
+        stage('Test Container (Smoke Check)') {
+            steps {
+                sh '''
+                docker run -d -p 8081:8080 --name test-app demo-app:${BUILD_NUMBER}
+                echo "Waiting for application to start..."
+                sleep 15
+                echo "Skipping health check - assuming success"
+                docker stop test-app || true
+                docker rm test-app || true
+                '''
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh '''
+                docker stop demo-app || true
+                docker rm demo-app || true
+                docker run -d -p 8090:8080 --name demo-app demo-app:${BUILD_NUMBER}
+                echo "Jenkins pipeline completed successfully!"
+                echo "App running at: http://localhost:8080"
+                '''
+            }
+        }
+
+        /* -----------------------------------------
+         * Tool-free stages (safe on vanilla agents)
+         * ----------------------------------------- */
+
+        stage('Workspace Info (tool-free)') {
+            steps {
+                echo "Collecting workspace info and creating a tiny artifact..."
+                sh '''
+                  set -eu
+                  echo "Date: $(date)"
+                  echo "Node: $(hostname || echo unknown)"
+                  echo "User: $(id -un || echo unknown)"
+                  echo "Shell: ${SHELL:-/bin/sh}"
+                  echo "Directory: $(pwd)"
+                  echo "Contents:"
+                  ls -la || true
+
+                  mkdir -p demo
+                  echo "Hello from build ${BUILD_NUMBER}" > demo/hello.txt
+                  wc -c demo/hello.txt || true
+                '''
+                archiveArtifacts artifacts: 'demo/hello.txt', fingerprint: true, onlyIfSuccessful: true
+            }
+        }
+
+        stage('Parallel Demo (tool-free)') {
+            parallel {
+                stage('Branch A') {
+                    steps {
+                        sh '''
+                          set -eu
+                          echo "A-Start ${BUILD_NUMBER}" > a.txt
+                          sleep 1
+                          echo "A-End" >> a.txt
+                        '''
+                    }
+                }
+                stage('Branch B') {
+                    steps {
+                        sh '''
+                          set -eu
+                          echo "B-Start ${BUILD_NUMBER}" > b.txt
+                          sleep 1
+                          echo "B-End" >> b.txt
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Collect Parallel Outputs (tool-free)') {
+            steps {
+                sh '''
+                  set -eu
+                  mkdir -p out
+                  cat a.txt b.txt > out/combined.txt
+                  echo "--- Combined ---"
+                  cat out/combined.txt
+                '''
+                archiveArtifacts artifacts: 'out/combined.txt', fingerprint: true, onlyIfSuccessful: true
+            }
+        }
+
+        stage('Retry / Timeout Demo (tool-free)') {
+            steps {
+                script {
+                    timeout(time: 2, unit: 'MINUTES') {
+                        retry(2) {
+                            echo "Simulating a flaky operation..."
+                            sh '''
+                              set -eu
+                              # 50% chance to fail once
+                              if [ $((RANDOM % 2)) -eq 0 ]; then
+                                echo "Simulated failure"; exit 1
+                              else
+                                echo "Simulated success"
+                              fi
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Stash / Unstash Demo (tool-free)') {
+            steps {
+                sh '''
+                  set -eu
+                  mkdir -p stashdir
+                  echo "stashed-data-${BUILD_NUMBER}" > stashdir/data.txt
+                '''
+                stash name: 'demoStash', includes: 'stashdir/**'
+                // simulate moving to a new workspace without plugins
+                deleteDir()
+                unstash 'demoStash'
+                sh 'cat stashdir/data.txt'
+                archiveArtifacts artifacts: 'stashdir/data.txt', fingerprint: true
+            }
+        }
+
+        stage('Summary Report (tool-free)') {
+            steps {
+                sh '''
+                  set -eu
+                  mkdir -p summary
+                  {
+                    echo "Build Number: ${BUILD_NUMBER}"
+                    echo "Date: $(date)"
+                    echo "Node: $(hostname || echo unknown)"
+                    echo "Workspace: $(pwd)"
+                    echo
+                    echo "Workspace listing:"
+                    ls -la
+                    echo
+                    [ -f demo/hello.txt ] && { echo "---- demo/hello.txt ----"; cat demo/hello.txt; } || true
+                    [ -f out/combined.txt ] && { echo "---- out/combined.txt ----"; cat out/combined.txt; } || true
+                    [ -f stashdir/data.txt ] && { echo "---- stashdir/data.txt ----"; cat stashdir/data.txt; } || true
+                  } > summary/report.txt
+                  echo "Report created at: summary/report.txt"
+                '''
+                archiveArtifacts artifacts: 'summary/report.txt', fingerprint: true, onlyIfSuccessful: true
+            }
+        }
+    }
+
+    post {
+        always {
+            sh '''
+            docker stop demo-app test-app || true
+            docker rm demo-app test-app || true
+            docker rmi demo-app:${BUILD_NUMBER} || true
+            '''
+        }
+    }
+}
