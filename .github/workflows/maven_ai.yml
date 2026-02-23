@@ -1,0 +1,151 @@
+name: Maven-AI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+# Use the dedicated Copilot secret for CLI auth
+env:
+  COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+
+jobs:
+  build:
+    runs-on: eks-edopsclt-custom-runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # Maven build with log capture (do not hard-fail yet so we can upload logs)
+      - name: Build Maven Project (capture logs)
+        id: mvn_build
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mvn -B clean compile package -DskipTests 2>&1 | tee maven.log
+          echo "${PIPESTATUS[0]}" > .mvn_exit_code
+
+      - name: Upload Maven build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maven-build-log
+          path: maven.log
+
+      # Fail the job if Maven failed (after uploading logs)
+      - name: Fail if Maven build failed
+        run: |
+          test "$(cat .mvn_exit_code)" -eq 0
+
+      # Docker build with log capture
+      - name: Build Docker Image (capture logs)
+        id: docker_build
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          docker build -t demo-app:${{ github.run_number }} . 2>&1 | tee dockerbuild.log
+          echo "${PIPESTATUS[0]}" > .docker_exit_code
+
+      - name: Upload Docker build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-build-log
+          path: dockerbuild.log
+
+      - name: Fail if Docker build failed
+        run: |
+          test "$(cat .docker_exit_code)" -eq 0
+
+  analyze-failure-with-copilot:
+    needs: build
+    if: failure()
+    runs-on: ubuntu-latest
+    env:
+      # Ensure the Copilot CLI sees the token explicitly
+      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+    steps:
+      - name: Download Maven build log
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: maven-build-log
+          path: logs/
+
+      - name: Download Docker build log
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: docker-build-log
+          path: logs/
+
+      - name: Prepare consolidated log
+        run: |
+          set -euo pipefail
+          LOGFILE="ci-logs.txt"
+          if ls logs/*.log >/dev/null 2>&1; then
+            (
+              for f in logs/*.log; do
+                echo "===================="
+                echo "FILE: $f"
+                echo "===================="
+                cat "$f"
+                echo
+              done
+            ) > "$LOGFILE"
+          else
+            echo "No logs found" > "$LOGFILE"
+          fi
+          echo "----- CI logs (head) -----"
+          head -n 200 "$LOGFILE" || true
+
+      - name: Install GitHub CLI + Copilot CLI
+        run: |
+          set -euo pipefail
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y gh
+          fi
+          # Install new Copilot CLI (gh extension) or upgrade if already present
+          gh extension install github/gh-copilot || gh extension upgrade github/gh-copilot
+          gh --version || true
+          gh copilot --version || true
+
+      - name: Analyze failure with Copilot (actionable fixes)
+        run: |
+          set -euo pipefail
+          echo "===== GitHub Copilot CLI: Analyzing CI failure (Maven/Docker) ====="
+          # Use the dedicated Copilot token; gh copilot will pick it up from COPILOT_GITHUB_TOKEN
+          cat ci-logs.txt | gh copilot explain --plain --title "Analyze CI failure (Maven/Docker)" \
+            --prompt "You are a senior Java and DevOps engineer. Read the CI logs from stdin and:
+            - Identify which stage(s) failed: Maven build/package or Docker build.
+            - Quote the exact error lines and a few surrounding lines for context.
+            - Provide precise fixes with code snippets: e.g., pom.xml (maven-compiler/surefire), dependency or plugin versions, JDK alignment, and Dockerfile corrections (FROM base image, COPY paths, RUN syntax).
+            - For repository/proxy/TLS issues, give concrete ~/.m2/settings.xml mirror/proxy snippets and mvn flags; mention Nexus/Artifactory mirrors if relevant.
+            - For dependency conflicts, show dependencyManagement or plugin version enforcement with examples.
+            - End with a short, numbered remediation checklist for local and CI.
+            Return clear, concise, copy-pasteable changes."
+                      echo "===== End Copilot analysis ====="
+
+      - name: Save Copilot analysis (artifact + summary)
+        run: |
+          set -euo pipefail
+          cat ci-logs.txt | gh copilot explain --plain --title "CI failure analysis (Maven/Docker)" \
+            --prompt "Summarize root cause(s), quote key error lines, and propose exact fixes with code snippets (pom.xml, Dockerfile, settings.xml). Finish with a step-by-step checklist for local and CI." \
+            > copilot-analysis.md
+          echo "## Copilot Failure Analysis (excerpt)" >> $GITHUB_STEP_SUMMARY
+          head -n 200 copilot-analysis.md >> $GITHUB_STEP_SUMMARY || true
+
+      - name: Upload Copilot analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: copilot-analysis
+          path: copilot-analysis.md
