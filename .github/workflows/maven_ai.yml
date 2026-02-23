@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: eks-edopsclt-custom-runner
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
