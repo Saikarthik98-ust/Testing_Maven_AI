@@ -1,4 +1,4 @@
-name: Maven-AI
+name: Maven Docker-AI
 
 on:
   push:
@@ -9,13 +9,9 @@ permissions:
   contents: read
   actions: read
 
-# Use the dedicated Copilot secret for CLI auth
-env:
-  COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: eks-edopsclt-custom-runner
     steps:
       - uses: actions/checkout@v4
 
@@ -70,7 +66,8 @@ jobs:
     if: failure()
     runs-on: ubuntu-latest
     env:
-      # Ensure the Copilot CLI sees the token explicitly
+      # IMPORTANT: set both so 'gh' works in CI and Copilot CLI uses the dedicated token
+      GH_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
       COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
     steps:
       - name: Download Maven build log
@@ -114,26 +111,30 @@ jobs:
             sudo apt-get update -y
             sudo apt-get install -y gh
           fi
-          # Install new Copilot CLI (gh extension) or upgrade if already present
-          gh extension install github/gh-copilot || gh extension upgrade github/gh-copilot
+          # gh uses GH_TOKEN automatically in Actions
           gh --version || true
+          echo "Checking gh auth (uses GH_TOKEN in CI)..."
+          gh auth status || true
+
+          echo "Installing (or upgrading) Copilot CLI..."
+          gh extension install github/gh-copilot || gh extension upgrade github/gh-copilot
           gh copilot --version || true
+          gh copilot status || true
 
       - name: Analyze failure with Copilot (actionable fixes)
         run: |
           set -euo pipefail
           echo "===== GitHub Copilot CLI: Analyzing CI failure (Maven/Docker) ====="
-          # Use the dedicated Copilot token; gh copilot will pick it up from COPILOT_GITHUB_TOKEN
           cat ci-logs.txt | gh copilot explain --plain --title "Analyze CI failure (Maven/Docker)" \
             --prompt "You are a senior Java and DevOps engineer. Read the CI logs from stdin and:
-            - Identify which stage(s) failed: Maven build/package or Docker build.
-            - Quote the exact error lines and a few surrounding lines for context.
-            - Provide precise fixes with code snippets: e.g., pom.xml (maven-compiler/surefire), dependency or plugin versions, JDK alignment, and Dockerfile corrections (FROM base image, COPY paths, RUN syntax).
-            - For repository/proxy/TLS issues, give concrete ~/.m2/settings.xml mirror/proxy snippets and mvn flags; mention Nexus/Artifactory mirrors if relevant.
-            - For dependency conflicts, show dependencyManagement or plugin version enforcement with examples.
-            - End with a short, numbered remediation checklist for local and CI.
+          - Identify which stage(s) failed: Maven build/package or Docker build.
+          - Quote the exact error lines and a few surrounding lines for context.
+          - Provide precise fixes with code snippets: e.g., pom.xml (maven-compiler/surefire), dependency or plugin versions, JDK alignment, and Dockerfile corrections (FROM base image, COPY paths, RUN syntax).
+          - For repository/proxy/TLS issues, give concrete ~/.m2/settings.xml mirror/proxy snippets and mvn flags; mention Nexus/Artifactory mirrors if relevant.
+          - For dependency conflicts, show dependencyManagement or plugin version enforcement with examples.
+          - End with a short, numbered remediation checklist for local and CI.
             Return clear, concise, copy-pasteable changes."
-                      echo "===== End Copilot analysis ====="
+                    echo "===== End Copilot analysis ====="
 
       - name: Save Copilot analysis (artifact + summary)
         run: |
